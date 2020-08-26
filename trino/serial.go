@@ -23,6 +23,7 @@ import (
 	"time"
 )
 
+// UnsupportedArgError UnsupportedArgError
 type UnsupportedArgError struct {
 	t string
 }
