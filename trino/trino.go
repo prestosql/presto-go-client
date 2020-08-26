@@ -99,26 +99,31 @@ var (
 )
 
 const (
-	preparedStatementHeader = "X-Trino-Prepared-Statement"
-	preparedStatementName   = "_trino_go"
-	trinoUserHeader         = "X-Trino-User"
-	trinoSourceHeader       = "X-Trino-Source"
-	trinoCatalogHeader      = "X-Trino-Catalog"
-	trinoSchemaHeader       = "X-Trino-Schema"
-	trinoSessionHeader      = "X-Trino-Session"
-	trinoSetCatalogHeader   = "X-Trino-Set-Catalog"
-	trinoSetSchemaHeader    = "X-Trino-Set-Schema"
-	trinoSetPathHeader      = "X-Trino-Set-Path"
-	trinoSetSessionHeader   = "X-Trino-Set-Session"
-	trinoClearSessionHeader = "X-Trino-Clear-Session"
-	trinoSetRoleHeader      = "X-Trino-Set-Role"
+	preparedStatementHeader  = "X-Trino-Prepared-Statement"
+	preparedStatementName    = "_trino_go"
+	trinoUserHeader          = "X-Trino-User"
+	trinoSourceHeader        = "X-Trino-Source"
+	trinoCatalogHeader       = "X-Trino-Catalog"
+	trinoSchemaHeader        = "X-Trino-Schema"
+	trinoSessionHeader       = "X-Trino-Session"
+	trinoSetCatalogHeader    = "X-Trino-Set-Catalog"
+	trinoSetSchemaHeader     = "X-Trino-Set-Schema"
+	trinoSetPathHeader       = "X-Trino-Set-Path"
+	trinoSetSessionHeader    = "X-Trino-Set-Session"
+	trinoClearSessionHeader  = "X-Trino-Clear-Session"
+	trinoSetRoleHeader       = "X-Trino-Set-Role"
+	trinoQueryCallbackHeader = "X-Query-Stats-Callback"
+	trinoQueryCallbackPeriod = "X-Query-Stats-CallbackPeriod"
 
+	// KerberosEnabledConfig KerberosEnabled
 	KerberosEnabledConfig    = "KerberosEnabled"
 	kerberosKeytabPathConfig = "KerberosKeytabPath"
 	kerberosPrincipalConfig  = "KerberosPrincipal"
 	kerberosRealmConfig      = "KerberosRealm"
 	kerberosConfigPathConfig = "KerberosConfigPath"
-	SSLCertPathConfig        = "SSLCertPath"
+
+	// SSLCertPathConfig SSLCertPath
+	SSLCertPathConfig = "SSLCertPath"
 )
 
 var (
@@ -217,6 +222,32 @@ type Conn struct {
 	httpHeaders     http.Header
 	kerberosClient  client.Client
 	kerberosEnabled bool
+	callback        QueryCallback
+	callbackPeriod  QueryCallbackPeriod
+}
+
+// CheckNamedValue check if NamedValue is by type assertion
+func (c *Conn) CheckNamedValue(value *driver.NamedValue) error {
+	// check if callback
+	callback, ok := value.Value.(QueryCallback)
+	if ok {
+		c.callback = callback
+		return driver.ErrRemoveArgument
+	}
+	// check if period
+	period, ok := value.Value.(float64)
+	if ok {
+		c.callbackPeriod.Period = period
+		c.callbackPeriod.CheckTime = time.Now()
+		return driver.ErrRemoveArgument
+	}
+	return driver.ErrSkip
+}
+
+// ResetSession resets callback to nil
+func (c *Conn) ResetSession(ctx context.Context) error {
+	c.callback = nil
+	return nil
 }
 
 var (
@@ -551,19 +582,20 @@ type stmtResponse struct {
 }
 
 type stmtStats struct {
-	State           string    `json:"state"`
-	Scheduled       bool      `json:"scheduled"`
-	Nodes           int       `json:"nodes"`
-	TotalSplits     int       `json:"totalSplits"`
-	QueuesSplits    int       `json:"queuedSplits"`
-	RunningSplits   int       `json:"runningSplits"`
-	CompletedSplits int       `json:"completedSplits"`
-	UserTimeMillis  int       `json:"userTimeMillis"`
-	CPUTimeMillis   int       `json:"cpuTimeMillis"`
-	WallTimeMillis  int       `json:"wallTimeMillis"`
-	ProcessedRows   int       `json:"processedRows"`
-	ProcessedBytes  int       `json:"processedBytes"`
-	RootStage       stmtStage `json:"rootStage"`
+	State              string    `json:"state"`
+	Scheduled          bool      `json:"scheduled"`
+	Nodes              int       `json:"nodes"`
+	TotalSplits        int       `json:"totalSplits"`
+	QueuesSplits       int       `json:"queuedSplits"`
+	RunningSplits      int       `json:"runningSplits"`
+	CompletedSplits    int       `json:"completedSplits"`
+	UserTimeMillis     int       `json:"userTimeMillis"`
+	CPUTimeMillis      int       `json:"cpuTimeMillis"`
+	WallTimeMillis     int       `json:"wallTimeMillis"`
+	ProcessedRows      int       `json:"processedRows"`
+	ProcessedBytes     int       `json:"processedBytes"`
+	RootStage          stmtStage `json:"rootStage"`
+	ProgressPercentage float32   `json:"progressPercentage"`
 }
 
 type stmtError struct {
@@ -642,6 +674,15 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 			if arg.Name == trinoUserHeader {
 				st.user = arg.Value.(string)
 				hs.Add(trinoUserHeader, st.user)
+			} else if arg.Name == trinoQueryCallbackHeader || arg.Name == trinoQueryCallbackPeriod { // if callback header exists
+				/**
+				Check if callback header exits
+				Set callback period in milliseconds determining how often the stats callback should be called during running state. If 0 it will be called as frequently as we get new stats from the server.
+				*/
+				err = st.conn.CheckNamedValue(&arg)
+				if err != nil {
+					return nil, err
+				}
 			} else {
 				if hs.Get(preparedStatementHeader) == "" {
 					hs.Add(preparedStatementHeader, preparedStatementName+"="+url.QueryEscape(st.query))
@@ -672,6 +713,17 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 	if err != nil {
 		return nil, fmt.Errorf("trino: %v", err)
 	}
+
+	// init query callback
+	if st.conn.callback != nil {
+		srStats := QueryResponse{
+			ID:         sr.ID,
+			QueryStats: sr.Stats,
+			Error:      sr.Error,
+		}
+		st.conn.callback.StatsUpdated(srStats)
+	}
+
 	return &sr, handleResponseError(resp.StatusCode, sr.Error)
 }
 
@@ -710,6 +762,7 @@ func (qr *driverRows) Close() error {
 	defer cancel()
 	resp, err := qr.stmt.conn.roundTrip(ctx, req)
 	if err != nil {
+		qr.stmt.conn.ResetSession(qr.ctx)
 		qferr, ok := err.(*ErrQueryFailed)
 		if ok && qferr.StatusCode == http.StatusNoContent {
 			qr.nextURI = ""
@@ -870,11 +923,34 @@ func (qr *driverRows) fetch(allowEOF bool) error {
 	qr.rowindex = 0
 	qr.data = qresp.Data
 	qr.nextURI = qresp.NextURI
+
+	qrStats := QueryResponse{
+		ID:         qresp.ID,
+		QueryStats: qresp.Stats,
+		Error:      qresp.Error,
+	}
+
 	if len(qr.data) == 0 {
 		if qr.nextURI != "" {
+			if qr.stmt.conn.callback != nil {
+				if qrStats.QueryStats.State == "RUNNING" {
+					currentTime := time.Now()
+					diff := currentTime.Sub(qr.stmt.conn.callbackPeriod.CheckTime).Milliseconds()
+					period := (time.Duration(qr.stmt.conn.callbackPeriod.Period) * time.Millisecond).Milliseconds()
+					// Check if period has passed
+					if diff >= period {
+						qr.stmt.conn.callback.StatsUpdated(qrStats)
+						qr.stmt.conn.callbackPeriod.CheckTime = currentTime
+					}
+				}
+			}
 			return qr.fetch(allowEOF)
 		}
 		if allowEOF {
+			if qr.stmt.conn.callback != nil {
+				// RUNNING -> FINISHED state change
+				qr.stmt.conn.callback.StatsUpdated(qrStats)
+			}
 			qr.err = io.EOF
 			return qr.err
 		}
@@ -1648,4 +1724,22 @@ func (s *NullSlice3Map) Scan(value interface{}) error {
 	s.Slice3Map = slice
 	s.Valid = true
 	return nil
+}
+
+// QueryResponse object used for callback
+type QueryResponse struct {
+	ID         string    `json:"id"`
+	QueryStats stmtStats `json:"stmtStats"`
+	Error      stmtError `json:"error"`
+}
+
+type QueryCallbackPeriod struct {
+	Period    float64   `json:"period"`
+	CheckTime time.Time `json:"checkTime"`
+}
+
+// QueryCallback interface for callback
+type QueryCallback interface {
+	// Called on query stats update, before and after query execution finished.
+	StatsUpdated(QueryResponse)
 }
