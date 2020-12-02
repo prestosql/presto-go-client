@@ -725,14 +725,15 @@ type queryColumn struct {
 type queryData []interface{}
 
 type typeSignature struct {
-	RawType          string        `json:"rawType"`
-	TypeArguments    []interface{} `json:"typeArguments"`
-	LiteralArguments []interface{} `json:"literalArguments"`
+	RawType          string                   `json:"rawType"`
+	Arguments        []typeSignatureParameter `json:"arguments"`
+	TypeArguments    []interface{}            `json:"typeArguments"`
+	LiteralArguments []interface{}            `json:"literalArguments"`
 }
 
-type infoResponse struct {
-	QueryID string `json:"queryId"`
-	State   string `json:"state"`
+type typeSignatureParameter struct {
+	Kind  string      `json:"kind"`
+	Value interface{} `json:"value"`
 }
 
 func handleResponseError(status int, respErr stmtError) error {
