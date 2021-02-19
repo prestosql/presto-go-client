@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package presto
+package trino
 
 import (
 	"context"
 	"database/sql"
 	"errors"
 	"flag"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -27,14 +28,14 @@ import (
 
 var (
 	integrationServerFlag = flag.String(
-		"presto_server_dsn",
-		os.Getenv("PRESTO_SERVER_DSN"),
-		"dsn of the presto server used for integration tests; default disabled",
+		"trino_server_dsn",
+		os.Getenv("TRINO_SERVER_DSN"),
+		"dsn of the Trino server used for integration tests; default disabled",
 	)
 	integrationServerQueryTimeout = flag.Duration(
-		"presto_query_timeout",
+		"trino_query_timeout",
 		5*time.Second,
-		"max duration for presto queries to run before giving up",
+		"max duration for Trino queries to run before giving up",
 	)
 )
 
@@ -61,7 +62,7 @@ func integrationOpen(t *testing.T, dsn ...string) *sql.DB {
 	if len(dsn) > 0 {
 		target = dsn[0]
 	}
-	db, err := sql.Open("presto", target)
+	db, err := sql.Open("trino", target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,13 +70,13 @@ func integrationOpen(t *testing.T, dsn ...string) *sql.DB {
 }
 
 // integration tests based on python tests:
-// https://github.com/prestosql/presto-python-client/tree/master/integration_tests
+// https://github.com/trinodb/trino-python-client/tree/master/integration_tests
 
 func TestIntegrationEnabled(t *testing.T) {
 	dsn := *integrationServerFlag
 	if dsn == "" {
 		example := "http://test@localhost:8080"
-		t.Skip("integration tests not enabled; use e.g. -presto_server_dsn=" + example)
+		t.Skip("integration tests not enabled; use e.g. -trino_server_dsn=" + example)
 	}
 }
 
@@ -420,5 +421,165 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 				t.Fatalf("expecting %d rows, got %d", scenario.expectedRows, count)
 			}
 		})
+	}
+}
+
+func TestIntegrationExec(t *testing.T) {
+	db := integrationOpen(t)
+	defer db.Close()
+
+	_, err := db.Query(`SELECT count(*) FROM nation`)
+	expected := "Schema must be specified when session schema is not set"
+	if err == nil || !strings.Contains(err.Error(), expected) {
+		t.Fatalf("Expected to fail to execute query with error: %v, got: %v", expected, err)
+	}
+
+	result, err := db.Exec("USE tpch.sf100")
+	if err != nil {
+		t.Fatal("Failed executing query:", err.Error())
+	}
+	if result == nil {
+		t.Fatal("Expected exec result to be not nil")
+	}
+
+	a, err := result.RowsAffected()
+	if err != nil {
+		t.Fatal("Expected RowsAffected not to return any error, got:", err)
+	}
+	if a != 0 {
+		t.Fatal("Expected RowsAffected to be zero, got:", a)
+	}
+	rows, err := db.Query(`SELECT count(*) FROM nation`)
+	if err != nil {
+		t.Fatal("Failed executing query:", err.Error())
+	}
+	if rows == nil || !rows.Next() {
+		t.Fatal("Failed fetching results")
+	}
+}
+
+func TestIntegrationUnsupportedHeader(t *testing.T) {
+	dsn := integrationServerDSN(t)
+	dsn += "?catalog=tpch&schema=sf10"
+	db := integrationOpen(t, dsn)
+	defer db.Close()
+	cases := []struct {
+		query string
+		err   error
+	}{
+		{
+			query: "SET SESSION grouped_execution=true",
+			err:   ErrUnsupportedHeader,
+		},
+		{
+			query: "SET ROLE dummy",
+			err:   ErrUnsupportedHeader,
+		},
+		{
+			query: "SET PATH dummy",
+			err:   errors.New(`trino: query failed (200 OK): "io.trino.spi.TrinoException: SET PATH not supported by client"`),
+		},
+		{
+			query: "RESET SESSION grouped_execution",
+			err:   ErrUnsupportedHeader,
+		},
+	}
+	for _, c := range cases {
+		_, err := db.Query(c.query)
+		if err == nil || err.Error() != c.err.Error() {
+			t.Fatal("unexpected error:", err)
+		}
+	}
+}
+
+func TestIntegrationQueryContextCancellation(t *testing.T) {
+	err := RegisterCustomClient("uncompressed", &http.Client{Transport: &http.Transport{DisableCompression: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := integrationServerDSN(t)
+	dsn += "?catalog=tpch&schema=sf100&source=cancel-test&custom_client=uncompressed"
+	db := integrationOpen(t, dsn)
+	defer db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 3)
+	done := make(chan struct{})
+	longQuery := "SELECT COUNT(*) FROM lineitem"
+	go func() {
+		// query will complete in ~7s unless cancelled
+		rows, err := db.QueryContext(ctx, longQuery)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		rows.Next()
+		if err = rows.Err(); err != nil {
+			errCh <- err
+			return
+		}
+		close(done)
+	}()
+
+	// poll system.runtime.queries and wait for query to start working
+	var queryID string
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer pollCancel()
+	for {
+		row := db.QueryRowContext(pollCtx, "SELECT query_id FROM system.runtime.queries WHERE state = 'RUNNING' AND source = 'cancel-test' AND query = ?", longQuery)
+		err := row.Scan(&queryID)
+		if err == nil {
+			break
+		}
+		if err != sql.ErrNoRows {
+			t.Fatal("failed to read query id", err)
+		}
+		if err = contextSleep(pollCtx, 100*time.Millisecond); err != nil {
+			t.Fatal("query did not start in 1 second")
+		}
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+		t.Fatal("unexpected query with cancelled context succeeded")
+		break
+	case err = <-errCh:
+		if !strings.Contains(err.Error(), "canceled") {
+			t.Fatal("expected err to be canceled but got:", err)
+		}
+	}
+
+	// poll system.runtime.queries and wait for query to be cancelled
+	pollCtx, pollCancel = context.WithTimeout(context.Background(), 1*time.Second)
+	defer pollCancel()
+	for {
+		row := db.QueryRowContext(pollCtx, "SELECT state, error_code FROM system.runtime.queries WHERE query_id = ?", queryID)
+		var state string
+		var code *string
+		err := row.Scan(&state, &code)
+		if err != nil {
+			t.Fatal("failed to read query id", err)
+		}
+		if state == "FAILED" && code != nil && *code == "USER_CANCELED" {
+			break
+		}
+		if err = contextSleep(pollCtx, 100*time.Millisecond); err != nil {
+			t.Fatal("query was not cancelled in 1 second; state, code, err are:", state, code, err)
+		}
+	}
+}
+
+func contextSleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(100 * time.Millisecond)
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		if !timer.Stop() {
+			<-timer.C
+		}
+		return ctx.Err()
 	}
 }
