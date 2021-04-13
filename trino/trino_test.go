@@ -238,6 +238,90 @@ func TestQueryForUsername(t *testing.T) {
 	}
 }
 
+type TestQueryCallback struct{}
+
+// Function called for every request made to Query
+func (*TestQueryCallback) StatsUpdated(qr QueryResponse) {
+	fmt.Printf("%+v, %+v \n", qr.QueryStats.State, qr.QueryStats.ProgressPercentage)
+}
+
+func TestQueryWithCallback(t *testing.T) {
+	c := &Config{
+		ServerURI:         "http://foobar@localhost:8080",
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+	dsn, err := c.FormatDSN()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("trino", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	callback := &TestQueryCallback{}
+
+	rows, err := db.Query("SELECT 2", sql.Named("X-Query-Stats-Callback", callback))
+	if err != nil {
+		t.Fatal("Failed executing query", err.Error())
+	}
+
+	if rows != nil {
+		for rows.Next() {
+			var ts string
+			err = rows.Scan(&ts)
+			if err != nil {
+				t.Fatal("Failed scanning query result", err.Error())
+			}
+			want := "2"
+			if ts != want {
+				t.Fatal("Expected value does not equal result value : ", ts, " != ", want)
+			}
+		}
+	}
+}
+
+func TestQueryWithCallbackAndPeriod(t *testing.T) {
+	c := &Config{
+		ServerURI:         "http://foobar@localhost:8080",
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+	dsn, err := c.FormatDSN()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("trino", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	callback := &TestQueryCallback{}
+	callbackPeriod := 1.0 * 100
+
+	rows, err := db.Query("SELECT 2", sql.Named("X-Query-Stats-Callback", callback), sql.Named("X-Query-Stats-CallbackPeriod", callbackPeriod))
+	if err != nil {
+		t.Fatal("Failed executing query", err.Error())
+	}
+
+	if rows != nil {
+		for rows.Next() {
+			var ts string
+			err = rows.Scan(&ts)
+			if err != nil {
+				t.Fatal("Failed scanning query result", err.Error())
+			}
+			want := "2"
+			if ts != want {
+				t.Fatal("Expected value does not equal result value : ", ts, " != ", want)
+			}
+		}
+	}
+}
+
 func TestQueryCancellation(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
